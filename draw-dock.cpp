@@ -14,9 +14,13 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPushButton>
+#include <QSpinBox>
 #include <QVBoxLayout>
 #include <QWidgetAction>
 #include <util/platform.h>
+#include <cmath>
+#include <string>
+#include <vector>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -450,6 +454,64 @@ DrawDock::DrawDock(QWidget *_parent) : QFrame(_parent), eventFilter(BuildEventFi
 			obs_data_release(settings);
 		});
 
+		auto followMenu = menu.addMenu(QString::fromUtf8(obs_module_text("FollowCursor")));
+		auto followEnabled = followMenu->addAction(QString::fromUtf8(obs_module_text("FollowEnabled")));
+		followEnabled->setCheckable(true);
+		followEnabled->setChecked(obs_data_get_bool(config, "follow_enabled"));
+		connect(followEnabled, &QAction::triggered, [this, followEnabled] {
+			obs_data_set_bool(config, "follow_enabled", followEnabled->isChecked());
+			if (!followEnabled->isChecked()) {
+				FollowCursorUpdate(false, 0, 0);
+			}
+			SaveConfig();
+		});
+
+		auto followSourceMenu = followMenu->addMenu(QString::fromUtf8(obs_module_text("FollowSource")));
+		if (obs_source_t *followSceneSource = obs_frontend_get_current_scene()) {
+			if (obs_scene_t *followScene = obs_scene_from_source(followSceneSource)) {
+				std::vector<std::string> names;
+				obs_scene_enum_items(
+					followScene,
+					[](obs_scene_t *, obs_sceneitem_t *item, void *param) {
+						auto n = static_cast<std::vector<std::string> *>(param);
+						obs_source_t *source = obs_sceneitem_get_source(item);
+						const char *name = source ? obs_source_get_name(source) : nullptr;
+						if (name && *name && strcmp(obs_source_get_unversioned_id(source), "draw_source") != 0) {
+							n->insert(n->begin(), name);
+						}
+						return true;
+					},
+					&names);
+				const char *current = obs_data_get_string(config, "follow_source");
+				for (const auto &name : names) {
+					auto sa = followSourceMenu->addAction(QString::fromUtf8(name.c_str()));
+					sa->setCheckable(true);
+					sa->setChecked(current && name == current);
+					connect(sa, &QAction::triggered, [this, name] {
+						FollowCursorReset();
+						obs_data_set_string(config, "follow_source", name.c_str());
+						SaveConfig();
+					});
+				}
+			}
+			obs_source_release(followSceneSource);
+		}
+
+		const char *followOffsetKeys[] = {"follow_offset_x", "follow_offset_y"};
+		const char *followOffsetLabels[] = {"FollowOffsetX", "FollowOffsetY"};
+		for (int i = 0; i < 2; i++) {
+			auto fwa = new QWidgetAction(followMenu);
+			auto spin = new QSpinBox(followMenu);
+			spin->setRange(-2000, 2000);
+			spin->setSuffix("px");
+			spin->setPrefix(QString::fromUtf8(obs_module_text(followOffsetLabels[i])) + " ");
+			spin->setValue((int)obs_data_get_int(config, followOffsetKeys[i]));
+			fwa->setDefaultWidget(spin);
+			followMenu->addAction(fwa);
+			std::string key = followOffsetKeys[i];
+			connect(spin, &QSpinBox::valueChanged, [this, key](int value) { obs_data_set_int(config, key.c_str(), value); });
+		}
+
 		menu.addSeparator();
 
 		menu.addAction(QString::fromUtf8(obs_module_text("Undo")), [this] {
@@ -641,6 +703,18 @@ DrawDock::DrawDock(QWidget *_parent) : QFrame(_parent), eventFilter(BuildEventFi
 	if (hotkeys) {
 		obs_hotkey_load(clearHotkey, hotkeys);
 		obs_data_array_release(hotkeys);
+	}
+	obs_data_set_default_int(config, "follow_offset_x", 24);
+	obs_data_set_default_int(config, "follow_offset_y", 24);
+	followTimer = new QTimer(this);
+	followTimer->setTimerType(Qt::PreciseTimer);
+	followTimer->setInterval(16);
+	connect(followTimer, &QTimer::timeout, this, [this] { FollowCursorTick(); });
+	followHotkey = obs_hotkey_register_frontend("draw_follow_cursor", obs_module_text("DrawFollowCursor"), follow_hotkey, this);
+	auto followHotkeys = obs_data_get_array(config, "follow_hotkey");
+	if (followHotkeys) {
+		obs_hotkey_load(followHotkey, followHotkeys);
+		obs_data_array_release(followHotkeys);
 	}
 	showHideHotkey = obs_hotkey_pair_register_frontend("draw_show", obs_module_text("DrawShow"), "draw_hide",
 							   obs_module_text("DrawHide"), show_hotkey, hide_hotkey, this, this);
@@ -891,6 +965,10 @@ DrawDock::DrawDock(QWidget *_parent) : QFrame(_parent), eventFilter(BuildEventFi
 
 DrawDock::~DrawDock()
 {
+	FollowCursorReset();
+	if (followHotkey != OBS_INVALID_HOTKEY_ID) {
+		obs_hotkey_unregister(followHotkey);
+	}
 	if (clearHotkey != OBS_INVALID_HOTKEY_ID) {
 		obs_hotkey_unregister(clearHotkey);
 	}
@@ -1370,6 +1448,8 @@ bool DrawDock::HandleMouseMoveEvent(QMouseEvent *event)
 		mouseLeave = !GetSourceRelativeXY(event->pos().x(), event->pos().y(), mouseEvent.x, mouseEvent.y);
 	}
 
+	FollowCursorUpdate(!mouseLeave, mouseEvent.x, mouseEvent.y);
+
 	move_event ce{mouseEvent.x, mouseEvent.y, mouseEvent.modifiers, mouseLeave, nullptr};
 
 	if (!mouseLeave) {
@@ -1505,7 +1585,8 @@ bool DrawDock::HandleTabletEvent(QTabletEvent *event)
 
 	int posx;
 	int posy;
-	GetSourceRelativeXY(event->position().x(), event->position().y(), posx, posy);
+	const bool tabletInside = GetSourceRelativeXY(event->position().x(), event->position().y(), posx, posy);
+	FollowCursorUpdate(tabletInside && event_type != QEvent::TabletLeaveProximity, posx, posy);
 	click_event ce{posx, posy, 0, 0, pressure <= 0.0, 1, nullptr};
 
 	obs_source_t *scene_source = obs_frontend_get_current_scene();
@@ -1649,7 +1730,10 @@ void DrawDock::frontend_event(enum obs_frontend_event event, void *data)
 		window->CreateDrawSource();
 	} else if (event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP || event == OBS_FRONTEND_EVENT_EXIT ||
 		   event == OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN || event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING) {
+		window->FollowCursorReset();
 		window->DestroyDrawSource();
+	} else if (event == OBS_FRONTEND_EVENT_SCENE_CHANGED) {
+		window->FollowCursorReset();
 	}
 }
 
@@ -1821,6 +1905,12 @@ void DrawDock::SaveConfig()
 	if (clearHotkeyData) {
 		obs_data_set_array(config, "clear_hotkey", clearHotkeyData);
 		obs_data_array_release(clearHotkeyData);
+	}
+
+	obs_data_array_t *followHotkeyData = obs_hotkey_save(followHotkey);
+	if (followHotkeyData) {
+		obs_data_set_array(config, "follow_hotkey", followHotkeyData);
+		obs_data_array_release(followHotkeyData);
 	}
 
 	obs_data_array_t *showHotkeyData = nullptr;
@@ -2068,6 +2158,170 @@ QAction *DrawDock::AddFavoriteTool(obs_data_t *tool)
 	}
 	favoriteToolHotkeys.emplace(hotkeyId, std::pair<QAction *, obs_data_t *>(action, tool));
 	return action;
+}
+
+void DrawDock::follow_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	UNUSED_PARAMETER(hotkey);
+	UNUSED_PARAMETER(id);
+	if (!pressed) {
+		return;
+	}
+
+	DrawDock *window = static_cast<DrawDock *>(data);
+	QMetaObject::invokeMethod(
+		window,
+		[window] {
+			if (!window->config) {
+				return;
+			}
+			const bool enabled = !obs_data_get_bool(window->config, "follow_enabled");
+			obs_data_set_bool(window->config, "follow_enabled", enabled);
+			if (!enabled) {
+				window->FollowCursorUpdate(false, 0, 0);
+			}
+		},
+		Qt::QueuedConnection);
+}
+
+// Called with the cursor position in canvas coordinates whenever the cursor moves over, or leaves, the preview.
+void DrawDock::FollowCursorUpdate(bool inside, int x, int y)
+{
+	if (!config || !obs_data_get_bool(config, "follow_enabled")) {
+		inside = false;
+	}
+	if (inside && draw_source) {
+		// GetSourceRelativeXY does not reject positions above or below the canvas
+		if (y < 0 || y > (int)obs_source_get_height(draw_source)) {
+			inside = false;
+		}
+	}
+	if (inside) {
+		vec2_set(&followCursor, (float)x, (float)y);
+		if (!followItem) {
+			const char *name = obs_data_get_string(config, "follow_source");
+			if (!name || !*name) {
+				return;
+			}
+			obs_source_t *scene_source = obs_frontend_get_current_scene();
+			if (!scene_source) {
+				return;
+			}
+			obs_scene_t *scene = obs_scene_from_source(scene_source);
+			obs_sceneitem_t *item = scene ? obs_scene_find_source(scene, name) : nullptr;
+			if (item) {
+				obs_sceneitem_addref(item);
+				followItem = item;
+				// Home is only captured here, so re-entering while the item floats back keeps the real home
+				obs_sceneitem_get_pos(item, &followHome);
+			}
+			obs_source_release(scene_source);
+		}
+	}
+	followInside = inside && followItem != nullptr;
+	if (followItem && !followTimer->isActive()) {
+		followTimer->start();
+	}
+}
+
+void DrawDock::FollowCursorTick()
+{
+	if (!followItem) {
+		followTimer->stop();
+		return;
+	}
+	if (!obs_sceneitem_get_scene(followItem)) {
+		// item was removed from its scene while following
+		obs_sceneitem_release(followItem);
+		followItem = nullptr;
+		followInside = false;
+		followTimer->stop();
+		return;
+	}
+
+	struct vec2 pos;
+	obs_sceneitem_get_pos(followItem, &pos);
+	struct vec2 target;
+	float ease;
+
+	if (followInside) {
+		// Bounding box of the item on the canvas, whatever its alignment, scale or rotation
+		matrix4 box{};
+		obs_sceneitem_get_box_transform(followItem, &box);
+		float minX = 0.0f, minY = 0.0f, maxX = 0.0f, maxY = 0.0f;
+		for (int i = 0; i < 4; i++) {
+			vec3 corner{};
+			vec3 out{};
+			vec3_set(&corner, (i & 1) ? 1.0f : 0.0f, (i & 2) ? 1.0f : 0.0f, 0.0f);
+			vec3_transform(&out, &corner, &box);
+			if (i == 0 || out.x < minX) {
+				minX = out.x;
+			}
+			if (i == 0 || out.x > maxX) {
+				maxX = out.x;
+			}
+			if (i == 0 || out.y < minY) {
+				minY = out.y;
+			}
+			if (i == 0 || out.y > maxY) {
+				maxY = out.y;
+			}
+		}
+		const float w = maxX - minX;
+		const float h = maxY - minY;
+		const float canvasW = draw_source ? (float)obs_source_get_width(draw_source) : 0.0f;
+		const float canvasH = draw_source ? (float)obs_source_get_height(draw_source) : 0.0f;
+		const float offsetX = (float)obs_data_get_int(config, "follow_offset_x");
+		const float offsetY = (float)obs_data_get_int(config, "follow_offset_y");
+
+		// Top-left of the item sits at cursor + offset; flip to the other side of the cursor at the canvas edge
+		float left = followCursor.x + offsetX;
+		if (canvasW > 0.0f && left + w > canvasW) {
+			left = followCursor.x - offsetX - w;
+		}
+		if (left < 0.0f) {
+			left = 0.0f;
+		}
+		float top = followCursor.y + offsetY;
+		if (canvasH > 0.0f && top + h > canvasH) {
+			top = followCursor.y - offsetY - h;
+		}
+		if (top < 0.0f) {
+			top = 0.0f;
+		}
+		vec2_set(&target, pos.x + (left - minX), pos.y + (top - minY));
+		ease = 0.45f;
+	} else {
+		vec2_copy(&target, &followHome);
+		ease = 0.18f;
+	}
+
+	const float dx = target.x - pos.x;
+	const float dy = target.y - pos.y;
+	if (!followInside && fabsf(dx) < 0.5f && fabsf(dy) < 0.5f) {
+		FollowCursorReset();
+		return;
+	}
+	pos.x += dx * ease;
+	pos.y += dy * ease;
+	obs_sceneitem_set_pos(followItem, &pos);
+}
+
+// Put the followed item straight back home and stop following
+void DrawDock::FollowCursorReset()
+{
+	if (followTimer) {
+		followTimer->stop();
+	}
+	followInside = false;
+	if (!followItem) {
+		return;
+	}
+	if (obs_sceneitem_get_scene(followItem)) {
+		obs_sceneitem_set_pos(followItem, &followHome);
+	}
+	obs_sceneitem_release(followItem);
+	followItem = nullptr;
 }
 
 void DrawDock::clear_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
@@ -2459,6 +2713,7 @@ void DrawDock::showEvent(QShowEvent *)
 
 void DrawDock::hideEvent(QHideEvent *)
 {
+	FollowCursorReset();
 	if (vendor) {
 		obs_websocket_vendor_emit_event(vendor, "hide", nullptr);
 	}
