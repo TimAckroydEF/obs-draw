@@ -75,6 +75,16 @@ private:
 	void FollowCursorTick();
 	void FollowCursorReset();
 
+	// Move mode (Pen unchecked): drag unlocked scene items around instead of drawing
+	QCheckBox *penCheckbox = nullptr;
+	obs_sceneitem_t *dragItem = nullptr;
+	struct vec2 dragStartPos = {};
+	int dragStartX = 0;
+	int dragStartY = 0;
+
+	bool HandleMoveModeClick(QMouseEvent *event);
+	void DragReset();
+
 	bool GetSourceRelativeXY(int mouseX, int mouseY, int &x, int &y);
 
 	bool HandleMouseClickEvent(QMouseEvent *event);
