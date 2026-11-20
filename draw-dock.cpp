@@ -893,6 +893,16 @@ DrawDock::DrawDock(QWidget *_parent) : QFrame(_parent), eventFilter(BuildEventFi
 	eraseCheckbox = new QCheckBox(QString::fromUtf8(obs_module_text("Erase")));
 	toolbar->addWidget(eraseCheckbox);
 
+	obs_data_set_default_bool(config, "pen_mode", true);
+	penCheckbox = new QCheckBox(QString::fromUtf8("Pen"));
+	penCheckbox->setToolTip(QString::fromUtf8("Checked: draw. Unchecked: drag unlocked sources around the canvas."));
+	penCheckbox->setChecked(obs_data_get_bool(config, "pen_mode"));
+	toolbar->addWidget(penCheckbox);
+	connect(penCheckbox, &QCheckBox::toggled, [this](bool checked) {
+		obs_data_set_bool(config, "pen_mode", checked);
+		DragReset();
+	});
+
 	auto alphaChange = [this] {
 		if (!draw_source) {
 			return;
@@ -965,6 +975,7 @@ DrawDock::DrawDock(QWidget *_parent) : QFrame(_parent), eventFilter(BuildEventFi
 
 DrawDock::~DrawDock()
 {
+	DragReset();
 	FollowCursorReset();
 	if (followHotkey != OBS_INVALID_HOTKEY_ID) {
 		obs_hotkey_unregister(followHotkey);
@@ -1243,6 +1254,91 @@ static bool HandleSceneMouseClickEvent(obs_scene_t *scene, obs_sceneitem_t *item
 	return true;
 }
 
+struct drag_hit_test {
+	float x;
+	float y;
+	obs_sceneitem_t *skip;
+	const char *skipName;
+	obs_sceneitem_t *hit;
+};
+
+// Scene items are enumerated bottom to top, so the last hit is the top-most one under the cursor
+static bool FindDragItem(obs_scene_t *scene, obs_sceneitem_t *item, void *data)
+{
+	UNUSED_PARAMETER(scene);
+	auto test = static_cast<struct drag_hit_test *>(data);
+	if (!obs_sceneitem_visible(item) || obs_sceneitem_locked(item) || item == test->skip) {
+		return true;
+	}
+	obs_source_t *source = obs_sceneitem_get_source(item);
+	if (!source || strcmp(obs_source_get_unversioned_id(source), "draw_source") == 0) {
+		return true;
+	}
+	const char *name = obs_source_get_name(source);
+	if (test->skipName && name && strcmp(test->skipName, name) == 0) {
+		return true;
+	}
+
+	matrix4 transform{};
+	matrix4 invTransform{};
+	vec3 pos3{};
+	vec3 local{};
+	vec3_set(&pos3, test->x, test->y, 0.0f);
+	obs_sceneitem_get_box_transform(item, &transform);
+	matrix4_inv(&invTransform, &transform);
+	vec3_transform(&local, &pos3, &invTransform);
+	if (local.x >= 0.0f && local.x <= 1.0f && local.y >= 0.0f && local.y <= 1.0f) {
+		test->hit = item;
+	}
+	return true;
+}
+
+bool DrawDock::HandleMoveModeClick(QMouseEvent *event)
+{
+	if (event->type() == QEvent::MouseButtonRelease) {
+		DragReset();
+		return true;
+	}
+	if (event->button() != Qt::LeftButton) {
+		return true;
+	}
+	int x = 0;
+	int y = 0;
+	if (!GetSourceRelativeXY(event->pos().x(), event->pos().y(), x, y)) {
+		return false;
+	}
+	DragReset();
+
+	obs_source_t *scene_source = obs_frontend_get_current_scene();
+	if (!scene_source) {
+		return true;
+	}
+	if (obs_scene_t *scene = obs_scene_from_source(scene_source)) {
+		// the item that follows the cursor is never draggable, it would fight the follow
+		const bool following = config && obs_data_get_bool(config, "follow_enabled");
+		drag_hit_test test{(float)x, (float)y, followItem, following ? obs_data_get_string(config, "follow_source") : nullptr,
+				   nullptr};
+		obs_scene_enum_items(scene, FindDragItem, &test);
+		if (test.hit) {
+			obs_sceneitem_addref(test.hit);
+			dragItem = test.hit;
+			obs_sceneitem_get_pos(dragItem, &dragStartPos);
+			dragStartX = x;
+			dragStartY = y;
+		}
+	}
+	obs_source_release(scene_source);
+	return true;
+}
+
+void DrawDock::DragReset()
+{
+	if (dragItem) {
+		obs_sceneitem_release(dragItem);
+		dragItem = nullptr;
+	}
+}
+
 bool DrawDock::HandleMouseClickEvent(QMouseEvent *event)
 {
 	auto event_type = event->type();
@@ -1260,6 +1356,9 @@ bool DrawDock::HandleMouseClickEvent(QMouseEvent *event)
 			scrollingFromY = event->pos().y();
 		}
 		return true;
+	}
+	if (penCheckbox && !penCheckbox->isChecked()) {
+		return HandleMoveModeClick(event);
 	}
 	uint32_t clickCount = 1;
 	if (event_type == QEvent::MouseButtonDblClick) {
@@ -1450,6 +1549,17 @@ bool DrawDock::HandleMouseMoveEvent(QMouseEvent *event)
 
 	FollowCursorUpdate(!mouseLeave, mouseEvent.x, mouseEvent.y);
 
+	if (dragItem && event->type() == QEvent::MouseMove) {
+		if (obs_sceneitem_get_scene(dragItem)) {
+			struct vec2 pos;
+			pos.x = dragStartPos.x + (float)(mouseEvent.x - dragStartX);
+			pos.y = dragStartPos.y + (float)(mouseEvent.y - dragStartY);
+			obs_sceneitem_set_pos(dragItem, &pos);
+		} else {
+			DragReset();
+		}
+	}
+
 	move_event ce{mouseEvent.x, mouseEvent.y, mouseEvent.modifiers, mouseLeave, nullptr};
 
 	if (!mouseLeave) {
@@ -1567,6 +1677,11 @@ bool DrawDock::HandleKeyEvent(QKeyEvent *event)
 bool DrawDock::HandleTabletEvent(QTabletEvent *event)
 {
 	if (!event) {
+		return false;
+	}
+
+	if (penCheckbox && !penCheckbox->isChecked()) {
+		// move mode: let Qt turn the stylus into ordinary mouse events
 		return false;
 	}
 
@@ -1730,9 +1845,11 @@ void DrawDock::frontend_event(enum obs_frontend_event event, void *data)
 		window->CreateDrawSource();
 	} else if (event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP || event == OBS_FRONTEND_EVENT_EXIT ||
 		   event == OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN || event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING) {
+		window->DragReset();
 		window->FollowCursorReset();
 		window->DestroyDrawSource();
 	} else if (event == OBS_FRONTEND_EVENT_SCENE_CHANGED) {
+		window->DragReset();
 		window->FollowCursorReset();
 	}
 }
