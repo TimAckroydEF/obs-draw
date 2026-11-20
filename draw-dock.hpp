@@ -7,6 +7,7 @@
 #include <QDoubleSpinBox>
 #include <QFrame>
 #include <QMouseEvent>
+#include <QTimer>
 #include <QToolBar>
 
 typedef std::function<bool(QObject *, QEvent *)> EventFilterFunc;
@@ -62,6 +63,18 @@ private:
 
 	void *vendor = nullptr;
 
+	// Follow cursor: a scene item in the current scene trails the cursor while it is over the preview
+	QTimer *followTimer = nullptr;
+	obs_sceneitem_t *followItem = nullptr;
+	struct vec2 followHome = {};
+	struct vec2 followCursor = {};
+	bool followInside = false;
+	obs_hotkey_id followHotkey = OBS_INVALID_HOTKEY_ID;
+
+	void FollowCursorUpdate(bool inside, int x, int y);
+	void FollowCursorTick();
+	void FollowCursorReset();
+
 	bool GetSourceRelativeXY(int mouseX, int mouseY, int &x, int &y);
 
 	bool HandleMouseClickEvent(QMouseEvent *event);
@@ -97,6 +110,7 @@ private:
 	static bool show_hotkey(void *data, obs_hotkey_pair_id id, obs_hotkey_t *hotkey, bool pressed);
 	static bool hide_hotkey(void *data, obs_hotkey_pair_id id, obs_hotkey_t *hotkey, bool pressed);
 	static void favorite_tool_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed);
+	static void follow_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed);
 	static void vendor_request_version(obs_data_t *request_data, obs_data_t *response_data, void *);
 	static void vendor_request_clear(obs_data_t *request_data, obs_data_t *response_data, void *);
 	static void vendor_request_draw(obs_data_t *request_data, obs_data_t *response_data, void *);
