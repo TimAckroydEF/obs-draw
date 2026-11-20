@@ -2248,7 +2248,7 @@ void DrawDock::FollowCursorTick()
 		// Bounding box of the item on the canvas, whatever its alignment, scale or rotation
 		matrix4 box{};
 		obs_sceneitem_get_box_transform(followItem, &box);
-		float minX = 0.0f, minY = 0.0f, maxX = 0.0f, maxY = 0.0f;
+		float minX = 0.0f, minY = 0.0f;
 		for (int i = 0; i < 4; i++) {
 			vec3 corner{};
 			vec3 out{};
@@ -2257,38 +2257,16 @@ void DrawDock::FollowCursorTick()
 			if (i == 0 || out.x < minX) {
 				minX = out.x;
 			}
-			if (i == 0 || out.x > maxX) {
-				maxX = out.x;
-			}
 			if (i == 0 || out.y < minY) {
 				minY = out.y;
 			}
-			if (i == 0 || out.y > maxY) {
-				maxY = out.y;
-			}
 		}
-		const float w = maxX - minX;
-		const float h = maxY - minY;
-		const float canvasW = draw_source ? (float)obs_source_get_width(draw_source) : 0.0f;
-		const float canvasH = draw_source ? (float)obs_source_get_height(draw_source) : 0.0f;
 		const float offsetX = (float)obs_data_get_int(config, "follow_offset_x");
 		const float offsetY = (float)obs_data_get_int(config, "follow_offset_y");
 
-		// Top-left of the item sits at cursor + offset; flip to the other side of the cursor at the canvas edge
-		float left = followCursor.x + offsetX;
-		if (canvasW > 0.0f && left + w > canvasW) {
-			left = followCursor.x - offsetX - w;
-		}
-		if (left < 0.0f) {
-			left = 0.0f;
-		}
-		float top = followCursor.y + offsetY;
-		if (canvasH > 0.0f && top + h > canvasH) {
-			top = followCursor.y - offsetY - h;
-		}
-		if (top < 0.0f) {
-			top = 0.0f;
-		}
+		// Top-left of the item always sits at cursor + offset, even where that takes it off the canvas
+		const float left = followCursor.x + offsetX;
+		const float top = followCursor.y + offsetY;
 		vec2_set(&target, pos.x + (left - minX), pos.y + (top - minY));
 		ease = 0.45f;
 	} else {
